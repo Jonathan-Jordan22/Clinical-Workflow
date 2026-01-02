@@ -1,67 +1,87 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from sqlalchemy.orm import Session
 
-from app.models import Patient, ClinicalTask
 from app.schemas import (
     PatientCreate,
     PatientResponse,
     TaskCreate,
-    TaskTransitionRequest,
     TaskResponse,
+    TaskTransitionRequest,
 )
-from app.services import transition_task
+from app.database import get_db
+from app.services import (
+    create_patient_db,
+    create_task_db,
+    transition_task_db,
+)
 from app.state_machine import InvalidTransitionError
 
 app = FastAPI(title="Clinical Workflow Simulation System")
 
-patients = {}
-tasks = {}
 
+@app.get("/")
+def root():
+    return {
+        "message": "Clinical Workflow API",
+        "docs": "/docs",
+        "endpoints": {
+            "create_patient": "POST /patients",
+            "create_task": "POST /tasks",
+            "transition_task": "POST /tasks/{task_id}/transition"
+        }
+    }
+
+# ------------------------
+# Patient Endpoints
+# ------------------------
 
 @app.post("/patients", response_model=PatientResponse)
-def create_patient(payload: PatientCreate):
-    patient = Patient(
-        name=payload.name,
-        date_of_birth=payload.date_of_birth,
-    )
-    patients[patient.id] = patient
+def create_patient_endpoint(payload: PatientCreate, db: Session = Depends(get_db)):
+    patient = create_patient_db(db, payload.name, payload.date_of_birth)
     return patient
 
+# ------------------------
+# Task Endpoints
+# ------------------------
 
 @app.post("/tasks", response_model=TaskResponse)
-def create_task(payload: TaskCreate):
-    if payload.patient_id not in patients:
-        raise HTTPException(status_code=404, detail="Patient not found")
-
-    task = ClinicalTask(
-        patient_id=payload.patient_id,
-        task_type=payload.task_type,
-    )
-    tasks[task.id] = task
+def create_task_endpoint(payload: TaskCreate, db: Session = Depends(get_db)):
+    try:
+        task = create_task_db(db, payload.patient_id, payload.task_type)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     return task
 
 @app.post("/tasks/{task_id}/transition", response_model=TaskResponse)
-def transition_task_endpoint(task_id: str, payload: TaskTransitionRequest):
-    task = tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
+def transition_task_endpoint(
+    task_id: str,
+    payload: TaskTransitionRequest,
+    db: Session = Depends(get_db)
+):
     try:
-        transition_task(
-            task=task,
-            new_status=payload.new_status,
-            reason=payload.reason,
-        )
+        task = transition_task_db(db, task_id, payload.new_status, payload.reason)
     except InvalidTransitionError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     return task
 
+# ------------------------
+# Audit Endpoint
+# ------------------------
+
 @app.get("/tasks/{task_id}/audit")
-def get_task_audit(task_id: str):
-    task = tasks.get(task_id)
+def get_task_audit(task_id: str, db: Session = Depends(get_db)):
+    from app.db_models import TaskDB
+    task = db.query(TaskDB).filter(TaskDB.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-
-    return task.audit_log
+    return [
+        {
+            "previous_status": event.previous_status,
+            "new_status": event.new_status,
+            "timestamp": event.timestamp,
+            "reason": event.reason,
+        }
+        for event in task.audit_log
+    ]
